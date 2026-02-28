@@ -43,9 +43,7 @@ npm run deploy-commands
 
 ### 起動
 
-```bash
-npm start
-```
+`run_bot.bat` をダブルクリックしてください。
 
 ## 使い方
 

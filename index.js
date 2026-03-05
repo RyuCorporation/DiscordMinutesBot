@@ -365,7 +365,7 @@ async function saveAndDisconnect() {
 // ============================================================
 // Bot起動
 // ============================================================
-client.once("ready", () => {
+client.once("clientReady", () => {
   console.log(`Bot ready as ${client.user.tag}`);
 });
 
@@ -374,6 +374,23 @@ client.once("ready", () => {
 // ============================================================
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === "leave") {
+    if (!connection) {
+      await interaction.reply({
+        content: "現在ボイスチャンネルに参加していません。",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.reply({
+      content: "🔌 ボイスチャンネルから退出します。議事録を作成中...",
+    });
+
+    await saveAndDisconnect();
+    return;
+  }
 
   if (interaction.commandName === "join") {
     if (connection) {
@@ -418,21 +435,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ボイスチャンネルの状態変化を監視
 // ============================================================
 client.on("voiceStateUpdate", async (oldState, newState) => {
-  const autoJoinChannelId = process.env.TARGET_VOICE_CHANNEL_ID;
-
-  // --- 自動参加（TARGET_VOICE_CHANNEL_ID設定時の後方互換） ---
-  if (
-    autoJoinChannelId &&
-    newState.channelId === autoJoinChannelId &&
-    oldState.channelId !== autoJoinChannelId &&
-    !connection
-  ) {
-    const channel = newState.channel;
-    sessionGuildId = channel.guild.id;
-    sessionTextChannelId = process.env.MINUTES_CHANNEL_ID || null;
-    startRecording(channel);
-  }
-
   // --- VCが空になったら自動離脱 ---
   if (connection && currentVoiceChannelId) {
     if (

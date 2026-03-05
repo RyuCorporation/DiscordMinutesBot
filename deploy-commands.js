@@ -1,8 +1,5 @@
 import "dotenv/config";
 import { REST, Routes, SlashCommandBuilder, ChannelType } from "discord.js";
-import { readFileSync } from "fs";
-
-const config = JSON.parse(readFileSync("./config.json", "utf-8"));
 
 const commands = [
   new SlashCommandBuilder()
@@ -16,12 +13,16 @@ const commands = [
         .setRequired(false)
     )
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName("leave")
+    .setDescription("ボイスチャンネルから退出し、議事録を作成します")
+    .toJSON(),
 ];
 
 const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
 
 await rest.put(
-  Routes.applicationGuildCommands(config.clientId, config.guildId),
+  Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
   { body: commands }
 );
 

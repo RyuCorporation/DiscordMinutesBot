@@ -1,6 +1,6 @@
 // index.js
 import "dotenv/config";
-import { Client, GatewayIntentBits, ChannelType, Events } from "discord.js";
+import { Client, GatewayIntentBits, ChannelType, Events, MessageFlags } from "discord.js";
 import { joinVoiceChannel, EndBehaviorType } from "@discordjs/voice";
 import prism from "prism-media";
 import fs from "fs";
@@ -379,7 +379,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!connection) {
       await interaction.reply({
         content: "現在ボイスチャンネルに参加していません。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -396,7 +396,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (connection) {
       await interaction.reply({
         content: "既にボイスチャンネルに参加中です。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -412,15 +412,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!member.voice.channel) {
         await interaction.reply({
           content: "ボイスチャンネルに参加してからコマンドを実行してください。",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
       targetChannel = member.voice.channel;
     }
 
-    // 議事録投稿先チャンネルを保存
-    sessionTextChannelId = interaction.channelId;
+    // 議事録投稿先チャンネルを保存（.env指定があればそちらを優先）
+    sessionTextChannelId = process.env.MINUTES_CHANNEL_ID || interaction.channelId;
 
     // 録音開始
     startRecording(targetChannel);

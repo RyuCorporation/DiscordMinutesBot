@@ -33,6 +33,7 @@ DISCORD_TOKEN=your_discord_bot_token
 CLIENT_ID=your_bot_client_id
 GUILD_ID=your_guild_id
 OPENAI_API_KEY=your_openai_api_key             # 省略可：文字起こし・要約用
+MINUTES_CHANNEL_ID=text_channel_id             # 省略可：議事録投稿先（未設定時は/join実行チャンネル）
 ```
 
 ### スラッシュコマンドの登録

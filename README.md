@@ -1,6 +1,8 @@
-# Discord Voice Recorder Bot
+# DiscordMinutesBot
 
 Discordのボイスチャンネルに参加し、ユーザーごとの音声を自動録音するBotです。全員が退出すると録音を保存し、オプションでWhisper APIによる文字起こしとChatGPTによる議事録生成を行います。
+
+![使用例](demo.png)
 
 ## 機能
 

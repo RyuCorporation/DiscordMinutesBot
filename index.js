@@ -35,7 +35,8 @@ const client = new Client({
 // --- セッション状態 ---
 let connection = null;
 const activeStreams = new Set(); // 重複subscribe防止用
-const userBuffers = new Map();  // userId -> [chunk, ...] セッション全体の録音バッファ
+const userBuffers = new Map();  // userId -> [{timestamp, chunk}, ...] タイムスタンプ付きPCMチャンク
+let sessionStartTime = null;    // セッション開始時刻（Date.now()）
 
 let sessionTextChannelId = null; // 議事録投稿先チャンネル
 let sessionGuildId = null;       // セッションのギルド
@@ -195,8 +196,13 @@ function startRecording(voiceChannel) {
     selfDeaf: false,
   });
 
+  connection.on("error", (err) => {
+    console.error("Voice connection error:", err.message);
+  });
+
   currentVoiceChannelId = voiceChannel.id;
   sessionGuildId = voiceChannel.guild.id;
+  sessionStartTime = Date.now();
   console.log(`Joined voice channel: ${voiceChannel.name}`);
 
   const receiver = connection.receiver;
@@ -220,10 +226,21 @@ function startRecording(voiceChannel) {
     });
 
     pcmStream.on("data", (chunk) => {
-      userBuffers.get(userId).push(chunk);
+      const timestamp = Date.now() - sessionStartTime;
+      userBuffers.get(userId).push({ timestamp, chunk });
     });
 
     pcmStream.on("end", () => {
+      activeStreams.delete(userId);
+    });
+
+    opusStream.on("error", (err) => {
+      console.error(`Opus stream error (${userId}):`, err.message);
+      activeStreams.delete(userId);
+    });
+
+    pcmStream.on("error", (err) => {
+      console.error(`PCM stream error (${userId}):`, err.message);
       activeStreams.delete(userId);
     });
 
@@ -258,64 +275,90 @@ async function saveAndDisconnect() {
   }
   fs.mkdirSync(sessionDir, { recursive: true });
 
-  const allTranscripts = [];
+  // --- 全ユーザーのチャンクをミックス ---
+  const bytesPerMs = SAMPLE_RATE * CHANNELS * (BIT_DEPTH / 8) / 1000;
 
-  for (const [userId, chunks] of userBuffers.entries()) {
-    const pcmBuffer = Buffer.concat(chunks);
-    if (pcmBuffer.length === 0) continue;
+  // セッション全体の長さを算出（ms）
+  let maxEndMs = 0;
+  for (const chunks of userBuffers.values()) {
+    for (const { timestamp, chunk } of chunks) {
+      const endMs = timestamp + chunk.length / bytesPerMs;
+      if (endMs > maxEndMs) maxEndMs = endMs;
+    }
+  }
 
-    // ユーザー名を取得
-    let username = userId;
-    try {
-      const user = await client.users.fetch(userId);
-      username = user.displayName || user.username;
-    } catch {}
+  if (maxEndMs === 0) {
+    // 録音データなし
+    userBuffers.clear();
+    activeStreams.clear();
+    sessionTextChannelId = null;
+    sessionGuildId = null;
+    currentVoiceChannelId = null;
+    sessionStartTime = null;
+    isProcessing = false;
+    return;
+  }
 
-    // アーカイブ用WAV保存（48kHz stereo）— 日付/ユーザー/recording.wav
-    const userDir = path.join(sessionDir, username);
-    fs.mkdirSync(userDir, { recursive: true });
-    const originalWavPath = path.join(userDir, "recording.wav");
-    writeWavFile(originalWavPath, pcmBuffer);
+  // ゼロ埋めバッファを用意（Int16サンプル単位で加算するため）
+  const totalBytes = Math.ceil(maxEndMs * bytesPerMs);
+  // 2バイト境界に揃える
+  const alignedBytes = totalBytes + (totalBytes % 2);
+  const mixBuffer = Buffer.alloc(alignedBytes);
 
-    const durationSec = (
-      pcmBuffer.length / (SAMPLE_RATE * CHANNELS * (BIT_DEPTH / 8))
-    ).toFixed(1);
-    console.log(`Saved: ${originalWavPath} (${durationSec}s)`);
+  for (const chunks of userBuffers.values()) {
+    for (const { timestamp, chunk } of chunks) {
+      const offsetBytes = Math.round(timestamp * bytesPerMs);
+      // 2バイト境界に揃える
+      const alignedOffset = offsetBytes - (offsetBytes % 2);
 
-    // OpenAI未設定ならスキップ
-    if (!openai) continue;
+      for (let i = 0; i < chunk.length - 1; i += 2) {
+        const pos = alignedOffset + i;
+        if (pos + 1 >= mixBuffer.length) break;
 
-    // Whisper用にダウンサンプル + チャンク分割
-    const monoBuffer = downsampleToMono(pcmBuffer);
+        const existing = mixBuffer.readInt16LE(pos);
+        const incoming = chunk.readInt16LE(i);
+        const mixed = Math.max(-32768, Math.min(32767, existing + incoming));
+        mixBuffer.writeInt16LE(mixed, pos);
+      }
+    }
+  }
+
+  // ミックス済みWAV保存（48kHz stereo）
+  const mixedWavPath = path.join(sessionDir, "recording.wav");
+  writeWavFile(mixedWavPath, mixBuffer);
+
+  const durationSec = (
+    mixBuffer.length / (SAMPLE_RATE * CHANNELS * (BIT_DEPTH / 8))
+  ).toFixed(1);
+  console.log(`Saved mixed recording: ${mixedWavPath} (${durationSec}s)`);
+
+  // --- Whisper文字起こし ---
+  let combinedTranscript = "";
+  if (openai) {
+    const monoBuffer = downsampleToMono(mixBuffer);
     const audioChunks = splitBuffer(monoBuffer);
 
-    let userTranscript = "";
     for (let i = 0; i < audioChunks.length; i++) {
-      const tempPath = path.join(RECORD_DIR, `temp_${userId}_${i}.wav`);
+      const tempPath = path.join(RECORD_DIR, `temp_mix_${i}.wav`);
       writeMonoWavFile(tempPath, audioChunks[i]);
 
       try {
         const text = await transcribeAudio(tempPath);
-        userTranscript += text + " ";
+        combinedTranscript += text + " ";
       } catch (err) {
-        console.error(`Whisper error for ${username} chunk ${i}:`, err.message);
+        console.error(`Whisper error chunk ${i}:`, err.message);
       }
 
-      // 一時ファイル削除
       try {
         fs.unlinkSync(tempPath);
       } catch {}
     }
 
-    if (userTranscript.trim()) {
-      allTranscripts.push(`【${username}】\n${userTranscript.trim()}`);
-    }
+    combinedTranscript = combinedTranscript.trim();
   }
 
   // 文字起こし・議事録の保存と投稿
-  if (openai && allTranscripts.length > 0) {
-    const combinedTranscript = allTranscripts.join("\n\n");
-
+  if (openai && combinedTranscript) {
     // 文字起こしテキストを日付フォルダに保存
     fs.writeFileSync(path.join(sessionDir, "transcript.txt"), combinedTranscript);
     console.log(`文字起こし保存: ${path.join(sessionDir, "transcript.txt")}`);
@@ -359,6 +402,7 @@ async function saveAndDisconnect() {
   sessionTextChannelId = null;
   sessionGuildId = null;
   currentVoiceChannelId = null;
+  sessionStartTime = null;
   isProcessing = false;
 }
 
@@ -450,6 +494,14 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
       }
     }
   }
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
 });
 
 client.login(process.env.DISCORD_TOKEN);

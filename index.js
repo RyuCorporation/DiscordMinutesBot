@@ -240,11 +240,25 @@ function startRecording(voiceChannel) {
     });
 
     pcmStream.on("error", (err) => {
+      // デコードエラーは無視して録音を継続（不正パケットをスキップ）
+      if (err.message && err.message.includes("Decode error")) {
+        return;
+      }
       console.error(`PCM stream error (${userId}):`, err.message);
       activeStreams.delete(userId);
     });
 
-    opusStream.pipe(pcmStream);
+    // pipe()を使うとエラー時にパイプラインが破壊されるため、手動でデータを転送
+    opusStream.on("data", (chunk) => {
+      if (!pcmStream.destroyed) {
+        pcmStream.write(chunk);
+      }
+    });
+    opusStream.on("end", () => {
+      if (!pcmStream.destroyed) {
+        pcmStream.end();
+      }
+    });
     console.log(`Recording started: ${userId}`);
   });
 }
@@ -332,29 +346,98 @@ async function saveAndDisconnect() {
   ).toFixed(1);
   console.log(`Saved mixed recording: ${mixedWavPath} (${durationSec}s)`);
 
-  // --- Whisper文字起こし ---
+  // --- ユーザーごとにWhisper文字起こし ---
   let combinedTranscript = "";
   if (openai) {
-    const monoBuffer = downsampleToMono(mixBuffer);
-    const audioChunks = splitBuffer(monoBuffer);
+    // ユーザーごとの音声バッファを構築し、個別に文字起こし
+    const allSegments = []; // { startMs, speaker, text }
 
-    for (let i = 0; i < audioChunks.length; i++) {
-      const tempPath = path.join(RECORD_DIR, `temp_mix_${i}.wav`);
-      writeMonoWavFile(tempPath, audioChunks[i]);
+    for (const [userId, chunks] of userBuffers.entries()) {
+      if (chunks.length === 0) continue;
 
+      // ユーザー名を取得
+      let username = userId;
       try {
-        const text = await transcribeAudio(tempPath);
-        combinedTranscript += text + " ";
-      } catch (err) {
-        console.error(`Whisper error chunk ${i}:`, err.message);
+        const guild = await client.guilds.fetch(sessionGuildId);
+        const member = await guild.members.fetch(userId);
+        username = member.displayName;
+      } catch {
+        try {
+          const user = await client.users.fetch(userId);
+          username = user.displayName || user.username;
+        } catch {}
       }
 
-      try {
-        fs.unlinkSync(tempPath);
-      } catch {}
+      // ユーザーごとのタイムライン音声バッファを構築
+      let userMaxEndMs = 0;
+      for (const { timestamp, chunk } of chunks) {
+        const endMs = timestamp + chunk.length / bytesPerMs;
+        if (endMs > userMaxEndMs) userMaxEndMs = endMs;
+      }
+
+      const userTotalBytes = Math.ceil(userMaxEndMs * bytesPerMs);
+      const userAlignedBytes = userTotalBytes + (userTotalBytes % 2);
+      const userBuffer = Buffer.alloc(userAlignedBytes);
+
+      for (const { timestamp, chunk } of chunks) {
+        const offsetBytes = Math.round(timestamp * bytesPerMs);
+        const alignedOffset = offsetBytes - (offsetBytes % 2);
+        for (let i = 0; i < chunk.length - 1; i += 2) {
+          const pos = alignedOffset + i;
+          if (pos + 1 >= userBuffer.length) break;
+          const existing = userBuffer.readInt16LE(pos);
+          const incoming = chunk.readInt16LE(i);
+          const mixed = Math.max(-32768, Math.min(32767, existing + incoming));
+          userBuffer.writeInt16LE(mixed, pos);
+        }
+      }
+
+      // ダウンサンプルしてWhisperに送信（verbose_jsonでタイムスタンプ取得）
+      const monoBuffer = downsampleToMono(userBuffer);
+      const audioChunks = splitBuffer(monoBuffer);
+
+      for (let i = 0; i < audioChunks.length; i++) {
+        const tempPath = path.join(RECORD_DIR, `temp_${userId}_${i}.wav`);
+        writeMonoWavFile(tempPath, audioChunks[i]);
+
+        try {
+          const file = fs.createReadStream(tempPath);
+          const response = await openai.audio.transcriptions.create({
+            model: "whisper-1",
+            file,
+            language: "ja",
+            response_format: "verbose_json",
+            timestamp_granularities: ["segment"],
+          });
+
+          // チャンクのオフセット（秒）を計算
+          const chunkOffsetSec = (i * 24 * 1024 * 1024) / (16000 * 2); // 16kHz mono 16bit
+          for (const seg of (response.segments || [])) {
+            const text = seg.text.trim();
+            if (!text) continue;
+            allSegments.push({
+              startMs: Math.round((seg.start + chunkOffsetSec) * 1000),
+              speaker: username,
+              text,
+            });
+          }
+        } catch (err) {
+          console.error(`Whisper error (${username} chunk ${i}):`, err.message);
+        }
+
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {}
+      }
     }
 
-    combinedTranscript = combinedTranscript.trim();
+    // タイムスタンプで時系列にソート
+    allSegments.sort((a, b) => a.startMs - b.startMs);
+
+    // 発言者: テキスト の形式で結合
+    combinedTranscript = allSegments
+      .map((s) => `${s.speaker}: ${s.text}`)
+      .join("\n");
   }
 
   // 文字起こし・議事録の保存と投稿

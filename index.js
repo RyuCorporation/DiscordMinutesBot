@@ -6,6 +6,7 @@ import prism from "prism-media";
 import fs from "fs";
 import path from "path";
 import OpenAI from "openai";
+import { spawn } from "child_process";
 
 // --- 定数 ---
 const RECORD_DIR = "./recordings";
@@ -146,28 +147,94 @@ async function transcribeAudio(wavFilePath) {
 }
 
 // ============================================================
-// ChatGPT APIで議事録要約
+// ミリ秒を [HH:MM:SS] / [MM:SS] 形式に変換
 // ============================================================
-async function summarizeTranscript(transcript) {
-  let systemPrompt = "議事録を作成してください。";
+function formatTimestamp(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const pad = (n) => String(n).padStart(2, "0");
+  return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+// ============================================================
+// Claude CLI (claude -p) をヘッドレス起動してタイムスタンプ形式の議事録を生成
+// 話が大まかに変わるところでセクション分割し、各セクションに
+//   見出し + 開始タイムスタンプ + 要約 + 実際の会話（話者: 発言）
+// を出力させる
+// ※ system prompt は --append-system-prompt で渡し、
+//   文字起こし本文は stdin から流し込む（長文でもコマンドライン長制限に当たらない）
+// ============================================================
+function summarizeTranscript(transcript) {
+  let configPrompt = "";
   try {
-    systemPrompt = fs.readFileSync("./config.md", "utf-8");
+    configPrompt = fs.readFileSync("./config.md", "utf-8");
   } catch {
-    console.warn("config.md が見つかりません。デフォルトのプロンプトを使用します。");
+    console.warn("config.md が見つかりません。デフォルトの方針で生成します。");
   }
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: `以下は会議の文字起こしです。議事録を作成してください。\n\n${transcript}`,
-      },
-    ],
-  });
+  const systemPrompt = `あなたは会議の議事録作成者です。タイムスタンプ付きの文字起こし（各行が「[タイムスタンプ] 話者: 発言」形式）を受け取り、以下のルールでMarkdownの議事録を作成してください。
 
-  return response.choices[0].message.content;
+# 出力ルール
+- 話題が大まかに変わったと思われるところでセクションを区切る（厳密な時間ではなく内容の切れ目で判断）。
+- 各セクションは次の構成にする:
+  ## [そのセクションの開始タイムスタンプ] セクションの見出し（話題を端的に表す）
+  **要約:** そのセクションで話された内容を2〜3文で簡潔にまとめる。
+  （空行）
+  - 話者名: 発言内容
+  - 話者名: 発言内容
+  （実際の会話を時系列でそのまま列挙。話者名と発言は文字起こしのものを使う）
+- タイムスタンプは文字起こしに含まれるものをそのまま使う。
+- 発言は要約せず、文字起こしの内容を保ったまま列挙する（読みやすさのため明らかな言い間違いや冗長な相槌の整理は可）。
+- 雑談だけのセクションは見出しに「雑談」と付けてよい。
+- 前置きや「議事録を作成しました」等の説明は一切書かず、議事録本文（Markdown）のみを出力する。${configPrompt ? `\n\n# 追加方針（config.md）\n${configPrompt}` : ""}`;
+
+  const userPrompt =
+    "以下はタイムスタンプ付きの会議の文字起こしです。ルールに従ってタイムスタンプ形式の議事録を作成してください。\n\n" +
+    transcript;
+
+  return new Promise((resolve, reject) => {
+    // Windowsでは claude が claude.cmd (バッチ) のため shell 経由で起動する
+    const child = spawn(
+      "claude",
+      ["-p", "--append-system-prompt", systemPrompt],
+      { shell: true }
+    );
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (d) => {
+      stdout += d.toString();
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString();
+    });
+
+    child.on("error", (err) => {
+      reject(new Error(`Claude CLIの起動に失敗しました: ${err.message}`));
+    });
+
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(
+          new Error(`Claude CLIが異常終了しました (code ${code}): ${stderr.trim()}`)
+        );
+        return;
+      }
+      const result = stdout.trim();
+      if (!result) {
+        reject(new Error(`Claude CLIの出力が空です。stderr: ${stderr.trim()}`));
+        return;
+      }
+      resolve(result);
+    });
+
+    // 文字起こし本文を stdin から渡して閉じる
+    child.stdin.write(userPrompt);
+    child.stdin.end();
+  });
 }
 
 // ============================================================
@@ -434,9 +501,9 @@ async function saveAndDisconnect() {
     // タイムスタンプで時系列にソート
     allSegments.sort((a, b) => a.startMs - b.startMs);
 
-    // 発言者: テキスト の形式で結合
+    // [タイムスタンプ] 発言者: テキスト の形式で結合
     combinedTranscript = allSegments
-      .map((s) => `${s.speaker}: ${s.text}`)
+      .map((s) => `[${formatTimestamp(s.startMs)}] ${s.speaker}: ${s.text}`)
       .join("\n");
   }
 

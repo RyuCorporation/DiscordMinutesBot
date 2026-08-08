@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "01KZGVZ1SB4D00A24SYC0KBQ3A",
+  "displayName": "DiscordBot",
+  "slug": "discordbot",
+  "kind": "general",
+  "createdAt": "2026-08-08T14:20:53.419438+00:00",
+  "updatedAt": "2026-08-08T14:20:53.419438+00:00",
+  "assetStore": null,
+  "archived": false,
+  "order": 10,
+  "linkedFrom": "D:/DiscordBot",
+  "port": 4010
+}

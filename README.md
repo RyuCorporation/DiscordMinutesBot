@@ -10,7 +10,8 @@ Discordのボイスチャンネルに参加し、ユーザーごとの音声を�
 - ユーザーごとに音声を分離して録音し、タイムスタンプで時系列にミックスした単一WAVファイルとして保存（48kHz / stereo）
 - 全員退出時に自動で切断・保存
 - OpenAI Whisper APIによる**話者名・タイムスタンプ付き**文字起こし（オプション）
-- Claude CLI（`claude -p`）による**タイムスタンプ／セクション形式**の議事録自動生成・Discordチャンネルへの投稿（オプション）
+- Claude CLI（`claude -p`）による**タイムスタンプ／セクション形式**の議事録自動生成（オプション）
+- 議事録・文字起こしを [TempestPhoenix](https://tp.liucotech.com) の **BlockNotion** へ自動記録し、そのページURLをDiscordのスレッドへ投稿
 
 ## セットアップ
 
@@ -37,9 +38,18 @@ CLIENT_ID=your_bot_client_id
 GUILD_ID=your_guild_id
 OPENAI_API_KEY=your_openai_api_key             # 省略可：文字起こし用
 MINUTES_CHANNEL_ID=text_channel_id             # 省略可：議事録投稿先（未設定時は/join実行チャンネル）
+
+# 議事録の記録先（TempestPhoenix の BlockNotion）
+TP_API_BASE=https://tp.liucotech.com
+TP_AGENT_API_KEY=tpx_agent_xxxxxxxx            # BlockNotion のエージェントAPIキー
+TP_MINUTES_PARENT_ID=blk_xxxxxxxx              # 議事録の親（「議事録」ページ）のブロックID
+TP_SITE_BASE=https://tp.liucotech.com/notion/  # 省略可：URL の組み立て先
 ```
 
 > `OPENAI_API_KEY` が未設定の場合は録音のみ行い、文字起こし・議事録生成はスキップされます。
+>
+> `TP_*` が未設定の場合、議事録の生成・ローカル保存までは行われますが BlockNotion への投稿は失敗し、
+> Discord のスレッドには失敗した旨が投稿されます。
 
 ### スラッシュコマンドの登録
 
@@ -60,7 +70,7 @@ npm start
 1. `/join` — Botが実行者のいるVCに参加し録音開始（チャンネル指定も可）
 2. `/leave` — Botを手動でVCから退出させ、議事録を作成
 3. VC内の全員が退出した場合も自動で録音停止・保存
-4. `OPENAI_API_KEY` 設定時は文字起こし・議事録が自動生成され、Discordに投稿される
+4. `OPENAI_API_KEY` 設定時は文字起こし・議事録が自動生成され、BlockNotion に記録されたうえで、そのURLがDiscordに投稿される
 
 ### 議事録のカスタマイズ
 
@@ -93,6 +103,29 @@ recordings/
     ...
 ```
 
+## 議事録の記録先（BlockNotion）
+
+議事録は TempestPhoenix の BlockNotion（`https://tp.liucotech.com/notion/`）に記録されます。
+
+- 「議事録」ページ（`TP_MINUTES_PARENT_ID`）の子として `議事録 <セッション名>` ページを作成
+- その子として `文字起こし <セッション名>` ページを作成（1行 = 1段落）
+- Discord には `📝 議事録: https://tp.liucotech.com/notion/#blk_...` の形でページURLだけを投稿
+
+BlockNotion は Markdown をそのまま保存できないため、議事録の Markdown は
+`blocknotion/markdown-to-blocks.js` でブロック（見出し・箇条書き・引用・表 等）へ変換してから投稿します。
+変換規則は TempestPhoenix の `src/Importer`（過去記事の移行に使ったもの）と同じです。
+
+投稿だけを単体で試す場合:
+
+```bash
+node post-minutes.js recordings/2026-08-01/議事録_2026-08-01.md
+```
+
+### エージェントAPIキー
+
+`TP_AGENT_API_KEY` は BlockNotion のエージェントキー（`tpx_agent_...`）です。
+キーは直接ヘッダに乗らず、`POST /api/admin/auth/agent-token` で短命の JWT に交換して使います。
+
 ## 既存録音からの議事録生成（スタンドアロン）
 
 `generate-minutes.js` は、既に保存済みの `recording.wav` から文字起こし・議事録を再生成するスクリプトです（ミックス音声からの生成のため話者分離なし、要約は GPT-4o を使用）。
@@ -108,3 +141,4 @@ node generate-minutes.js recordings/2026-03-14
 - [prism-media](https://github.com/amishshah/prism-media) — Opus→PCMデコード
 - [OpenAI API](https://platform.openai.com/) — Whisper（文字起こし）
 - [Claude Code CLI](https://claude.com/claude-code) — 議事録の要約生成（`generate-minutes.js` のみ GPT-4o）
+- TempestPhoenix BlockNotion — 議事録・文字起こしの記録先

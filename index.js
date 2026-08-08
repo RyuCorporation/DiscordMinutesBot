@@ -7,6 +7,7 @@ import fs from "fs";
 import path from "path";
 import OpenAI from "openai";
 import { spawn } from "child_process";
+import { postMinutesToBlockNotion } from "./post-minutes.js";
 
 // --- 定数 ---
 const RECORD_DIR = "./recordings";
@@ -524,19 +525,38 @@ async function saveAndDisconnect() {
       fs.writeFileSync(minutesPath, summary);
       console.log(`議事録保存: ${minutesPath}`);
 
-      // Discordテキストチャンネルに投稿
+      // BlockNotion（TempestPhoenix）へ自動投稿。議事録ページ＋文字起こし子ページを作り、URLを得る。
+      // 失敗してもローカルの議事録は保存済み。
+      let minutesUrl = null;
+      try {
+        const result = await postMinutesToBlockNotion({
+          label: sessionName,
+          summary,
+          transcript: combinedTranscript,
+        });
+        minutesUrl = result.url;
+        console.log(`BlockNotion 投稿成功: ${result.url}`);
+      } catch (err) {
+        console.error("BlockNotion 投稿失敗（議事録ファイルは保存済み）:", err.name, "-", err.message);
+      }
+
+      // Discordに「議事録 <日付>」だけ投稿し、そのメッセージのスレッドにBlockNotionのリンクを貼る。
       if (sessionTextChannelId && sessionGuildId) {
         try {
           const guild = await client.guilds.fetch(sessionGuildId);
           const channel = await guild.channels.fetch(sessionTextChannelId);
 
-          const sessionName = path.basename(sessionDir);
-          const fullMessage = `## 📝 議事録 ${sessionName}\n` + summary;
-          const messageParts = splitMessageContent(fullMessage);
-          for (const part of messageParts) {
-            await channel.send(part);
+          const headerMessage = await channel.send(`議事録 ${sessionName}`);
+          const thread = await headerMessage.startThread({
+            name: `議事録 ${sessionName}`,
+          });
+
+          if (minutesUrl) {
+            await thread.send(`📝 議事録: ${minutesUrl}`);
+          } else {
+            await thread.send("⚠️ BlockNotion への投稿に失敗しました。ローカルの議事録ファイルを参照してください。");
           }
-          console.log("議事録をDiscordに投稿しました。");
+          console.log("議事録スレッドをDiscordに作成しました。");
         } catch (err) {
           console.error("Discord投稿エラー:", err.message);
         }

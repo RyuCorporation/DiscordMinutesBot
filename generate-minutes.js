@@ -6,6 +6,7 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import OpenAI from "openai";
+import { postMinutesToBlockNotion } from "./post-minutes.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -169,9 +170,27 @@ async function main() {
 
   console.log("\n--- 議事録 ---\n");
   console.log(summary);
+
+  // BlockNotion（TempestPhoenix）へ自動投稿。失敗してもローカルの議事録は残っているので致命的ではない。
+  try {
+    console.log("\nBlockNotion へ投稿中...");
+    const result = await postMinutesToBlockNotion({
+      label: sessionName,
+      summary,
+      transcript,
+    });
+    console.log(`BlockNotion 投稿成功: ${result.url}`);
+  } catch (err) {
+    console.error("BlockNotion 投稿失敗（議事録ファイルは保存済み）:", err.name, "-", err.message);
+  }
 }
 
-main().catch((err) => {
-  console.error("エラー:", err);
-  process.exit(1);
-});
+// このファイルが直接実行されたときだけ main() を走らせる。
+// import しただけで Whisper 再文字起こしが走り、recordings/ の transcript.txt と議事録を
+// 上書きしてしまうため（post-minutes.js と同じガード）。
+if (process.argv[1]?.endsWith("generate-minutes.js")) {
+  main().catch((err) => {
+    console.error("エラー:", err);
+    process.exit(1);
+  });
+}

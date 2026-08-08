@@ -3,5 +3,12 @@ node_modules/
 config.json
 recordings/
 .claude/
-CLAUDE.md
 config.md
+
+# オーケストレーター管理領域（揮発値はコミットしない。定義ファイルは追跡する）
+.orchestrator/state.json
+.orchestrator/session.json
+.orchestrator/tasks.json
+.orchestrator/tasks/
+.orchestrator/bulk_start.json
+.orchestrator/*.tmp

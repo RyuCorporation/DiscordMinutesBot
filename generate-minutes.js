@@ -1,12 +1,28 @@
 // generate-minutes.js
 // 既存の recording.wav から議事録を生成するスタンドアロンスクリプト
-// Usage: node generate-minutes.js [recordings/2026-03-14]
+// Usage: node generate-minutes.js [recordings/2026-03-14] [--force-transcribe] [--page blk_xxx]
+//
+//   既に transcript.txt がある場合は Whisper を呼ばずにそれを使う（やり直しで課金しないため）。
+//   文字起こしからやり直したいときだけ --force-transcribe を付ける。
+//   生成後は BlockNotion へ投稿し、MINUTES_CHANNEL_ID があれば Discord にもリンクを流す。
+//   --page を付けると新規作成ではなく既存ページの中身を差し替える（リンクを貼り直さずに済む。
+//   このとき Discord へは投稿しない）。
+//
+//   議事録の書き方（タイムスタンプ形式・原文の流れを残す）は index.js と共通で summarize.js にある。
 
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import OpenAI from "openai";
-import { postMinutesToBlockNotion } from "./post-minutes.js";
+import { Client, GatewayIntentBits } from "discord.js";
+import {
+  postMinutesToBlockNotion,
+  replaceMinutesPage,
+  sessionDateFromLabel,
+} from "./post-minutes.js";
+import { summarizeTranscript, formatTimestamp } from "./summarize.js";
+import { buildMinutesPostHeader } from "./usage-metrics.js";
+import { readOpenAICreditBalance } from "./billing-balance.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -63,11 +79,68 @@ function splitBuffer(buffer, maxBytes = 24 * 1024 * 1024) {
   return chunks;
 }
 
+// --- Discord投稿 ---
+// index.js と同じ形（「議事録 <日付>」メッセージ + そのスレッドにBlockNotionのリンク）で投稿する。
+// スタンドアロン実行では interaction が無いので、投稿先は MINUTES_CHANNEL_ID のみ。
+async function postMinutesLinkToDiscord({ sessionName, minutesUrl, usedTokens }) {
+  const channelId = process.env.MINUTES_CHANNEL_ID;
+  if (!channelId || !process.env.DISCORD_TOKEN) {
+    console.log(
+      "MINUTES_CHANNEL_ID / DISCORD_TOKEN が未設定のため、Discordへの投稿はスキップします。"
+    );
+    return;
+  }
+
+  // 残高は取れなくても投稿自体は続ける（ヘッダーが「取得不可」になるだけ）。
+  let creditBalanceUsd = null;
+  try {
+    creditBalanceUsd = await readOpenAICreditBalance();
+  } catch (err) {
+    console.warn("クレジット残高の取得に失敗しました:", err.message);
+  }
+
+  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  try {
+    await client.login(process.env.DISCORD_TOKEN);
+    const channel = await client.channels.fetch(channelId);
+    const headerMessage = await channel.send(
+      buildMinutesPostHeader(sessionName, usedTokens, creditBalanceUsd)
+    );
+    const thread = await headerMessage.startThread({ name: `議事録 ${sessionName}` });
+    await thread.send(`📝 議事録: ${minutesUrl}`);
+    console.log("議事録スレッドをDiscordに作成しました。");
+  } finally {
+    await client.destroy();
+  }
+}
+
 // --- メイン処理 ---
 async function main() {
-  const sessionDir = process.argv[2] || "./recordings/2026-03-14";
-  const wavPath = path.join(sessionDir, "recording.wav");
+  const args = process.argv.slice(2);
+  const forceTranscribe = args.includes("--force-transcribe");
+  // --page blk_xxx / --page=blk_xxx で既存の議事録ページを差し替える（新規作成しない）
+  const pageFlagIndex = args.findIndex((a) => a === "--page");
+  const replacePageId =
+    (pageFlagIndex >= 0 ? args[pageFlagIndex + 1] : null) ??
+    args.find((a) => a.startsWith("--page="))?.slice("--page=".length) ??
+    null;
+  const pageValueIndex = pageFlagIndex >= 0 ? pageFlagIndex + 1 : -1;
+  const positional = args.filter((a, i) => !a.startsWith("--") && i !== pageValueIndex);
+  const sessionDir = positional[0] || "./recordings/2026-03-14";
+  const transcriptPath = path.join(sessionDir, "transcript.txt");
 
+  // 既存の文字起こしがあればWhisperを呼ばずに再利用する（議事録だけ作り直すケース）。
+  const existingTranscript =
+    !forceTranscribe && fs.existsSync(transcriptPath)
+      ? fs.readFileSync(transcriptPath, "utf-8").trim()
+      : "";
+  if (existingTranscript) {
+    console.log(`既存の文字起こしを再利用: ${transcriptPath}`);
+    await generateAndPost(sessionDir, existingTranscript, { replacePageId });
+    return;
+  }
+
+  const wavPath = path.join(sessionDir, "recording.wav");
   if (!fs.existsSync(wavPath)) {
     console.error(`ファイルが見つかりません: ${wavPath}`);
     process.exit(1);
@@ -129,8 +202,11 @@ async function main() {
   // タイムスタンプでソート
   allSegments.sort((a, b) => a.startSec - b.startSec);
 
-  // ミックス済み音声なので話者分離なし
-  const transcript = allSegments.map((s) => s.text).join("\n");
+  // ミックス済み音声なので話者分離はできない。
+  // ただしタイムスタンプは議事録の骨組みになるので index.js と同じ形で残す（話者名だけ無い）。
+  const transcript = allSegments
+    .map((s) => `[${formatTimestamp(s.startSec * 1000)}] ${s.text}`)
+    .join("\n");
 
   if (!transcript) {
     console.error("文字起こし結果が空です。");
@@ -138,32 +214,24 @@ async function main() {
   }
 
   // 文字起こし保存
-  const transcriptPath = path.join(sessionDir, "transcript.txt");
   fs.writeFileSync(transcriptPath, transcript);
   console.log(`文字起こし保存: ${transcriptPath}`);
 
-  // ChatGPTで議事録生成
-  console.log("議事録を生成中...");
-  let systemPrompt = "議事録を作成してください。";
-  try {
-    systemPrompt = fs.readFileSync("./config.md", "utf-8");
-  } catch {
-    console.warn("config.md が見つかりません。デフォルトのプロンプトを使用します。");
-  }
+  await generateAndPost(sessionDir, transcript, { replacePageId });
+}
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: systemPrompt },
-      {
-        role: "user",
-        content: `以下は会議の文字起こしです。議事録を作成してください。\n（注意: ミックス音声からの文字起こしのため、話者の分離はされていません。文脈から発言者を推測してください。）\n\n${transcript}`,
-      },
-    ],
+// --- 議事録の生成と投稿（文字起こしができた後の共通処理） ---
+// 議事録の書き方は index.js（録音直後の本番経路）と同じ summarize.js に寄せている。
+// ミックス音声からの文字起こしには話者名が無いので hasSpeakers: false で渡す。
+async function generateAndPost(sessionDir, transcript, { replacePageId = null } = {}) {
+  const sessionName = path.basename(sessionDir);
+
+  console.log("議事録を生成中...");
+  const { summary, usedTokens } = await summarizeTranscript(transcript, {
+    sessionDate: sessionDateFromLabel(sessionName),
+    hasSpeakers: false,
   });
 
-  const summary = response.choices[0].message.content;
-  const sessionName = path.basename(sessionDir);
   const minutesPath = path.join(sessionDir, `議事録_${sessionName}.md`);
   fs.writeFileSync(minutesPath, summary);
   console.log(`議事録保存: ${minutesPath}`);
@@ -171,17 +239,41 @@ async function main() {
   console.log("\n--- 議事録 ---\n");
   console.log(summary);
 
-  // BlockNotion（TempestPhoenix）へ自動投稿。失敗してもローカルの議事録は残っているので致命的ではない。
+  // BlockNotion（TempestPhoenix）へ投稿。失敗してもローカルの議事録は残っているので致命的ではない。
+  // --page 指定時は既存ページの中身を差し替える（ページ ID が変わらないので既存のリンクが生きる）。
+  let minutesUrl = null;
   try {
-    console.log("\nBlockNotion へ投稿中...");
-    const result = await postMinutesToBlockNotion({
-      label: sessionName,
-      summary,
-      transcript,
-    });
-    console.log(`BlockNotion 投稿成功: ${result.url}`);
+    if (replacePageId) {
+      console.log(`\nBlockNotion の既存ページを差し替え中: ${replacePageId}`);
+      const result = await replaceMinutesPage({
+        pageId: replacePageId,
+        label: sessionName,
+        summary,
+        transcript,
+      });
+      console.log(`BlockNotion 差し替え成功: ${result.url}`);
+    } else {
+      console.log("\nBlockNotion へ投稿中...");
+      const result = await postMinutesToBlockNotion({
+        label: sessionName,
+        summary,
+        transcript,
+      });
+      minutesUrl = result.url;
+      console.log(`BlockNotion 投稿成功: ${result.url}`);
+    }
   } catch (err) {
-    console.error("BlockNotion 投稿失敗（議事録ファイルは保存済み）:", err.name, "-", err.message);
+    console.error("BlockNotion への反映に失敗（議事録ファイルは保存済み）:", err.name, "-", err.message);
+  }
+
+  // Discordへリンクを投稿。新規ページを作ったときだけで、
+  // 差し替えのときは既に貼られているリンクが同じページを指すので投稿しない。
+  if (minutesUrl) {
+    try {
+      await postMinutesLinkToDiscord({ sessionName, minutesUrl, usedTokens });
+    } catch (err) {
+      console.error("Discord投稿エラー:", err.message);
+    }
   }
 }
 

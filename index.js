@@ -6,8 +6,10 @@ import prism from "prism-media";
 import fs from "fs";
 import path from "path";
 import OpenAI from "openai";
-import { spawn } from "child_process";
-import { postMinutesToBlockNotion } from "./post-minutes.js";
+import { readOpenAICreditBalance } from "./billing-balance.js";
+import { postMinutesToBlockNotion, sessionDateFromLabel } from "./post-minutes.js";
+import { summarizeTranscript, formatTimestamp } from "./summarize.js";
+import { buildMinutesPostHeader } from "./usage-metrics.js";
 
 // --- 定数 ---
 const RECORD_DIR = "./recordings";
@@ -147,96 +149,6 @@ async function transcribeAudio(wavFilePath) {
   return response;
 }
 
-// ============================================================
-// ミリ秒を [HH:MM:SS] / [MM:SS] 形式に変換
-// ============================================================
-function formatTimestamp(ms) {
-  const totalSec = Math.floor(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  const pad = (n) => String(n).padStart(2, "0");
-  return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
-}
-
-// ============================================================
-// Claude CLI (claude -p) をヘッドレス起動してタイムスタンプ形式の議事録を生成
-// 話が大まかに変わるところでセクション分割し、各セクションに
-//   見出し + 開始タイムスタンプ + 要約 + 実際の会話（話者: 発言）
-// を出力させる
-// ※ system prompt は --append-system-prompt で渡し、
-//   文字起こし本文は stdin から流し込む（長文でもコマンドライン長制限に当たらない）
-// ============================================================
-function summarizeTranscript(transcript) {
-  let configPrompt = "";
-  try {
-    configPrompt = fs.readFileSync("./config.md", "utf-8");
-  } catch {
-    console.warn("config.md が見つかりません。デフォルトの方針で生成します。");
-  }
-
-  const systemPrompt = `あなたは会議の議事録作成者です。タイムスタンプ付きの文字起こし（各行が「[タイムスタンプ] 話者: 発言」形式）を受け取り、以下のルールでMarkdownの議事録を作成してください。
-
-# 出力ルール
-- 話題が大まかに変わったと思われるところでセクションを区切る（厳密な時間ではなく内容の切れ目で判断）。
-- 各セクションは次の構成にする:
-  ## [そのセクションの開始タイムスタンプ] セクションの見出し（話題を端的に表す）
-  **要約:** そのセクションで話された内容を2〜3文で簡潔にまとめる。
-  （空行）
-  - 話者名: 発言内容
-  - 話者名: 発言内容
-  （実際の会話を時系列でそのまま列挙。話者名と発言は文字起こしのものを使う）
-- タイムスタンプは文字起こしに含まれるものをそのまま使う。
-- 発言は要約せず、文字起こしの内容を保ったまま列挙する（読みやすさのため明らかな言い間違いや冗長な相槌の整理は可）。
-- 雑談だけのセクションは見出しに「雑談」と付けてよい。
-- 前置きや「議事録を作成しました」等の説明は一切書かず、議事録本文（Markdown）のみを出力する。${configPrompt ? `\n\n# 追加方針（config.md）\n${configPrompt}` : ""}`;
-
-  const userPrompt =
-    "以下はタイムスタンプ付きの会議の文字起こしです。ルールに従ってタイムスタンプ形式の議事録を作成してください。\n\n" +
-    transcript;
-
-  return new Promise((resolve, reject) => {
-    // Windowsでは claude が claude.cmd (バッチ) のため shell 経由で起動する
-    const child = spawn(
-      "claude",
-      ["-p", "--append-system-prompt", systemPrompt],
-      { shell: true }
-    );
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (d) => {
-      stdout += d.toString();
-    });
-    child.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
-
-    child.on("error", (err) => {
-      reject(new Error(`Claude CLIの起動に失敗しました: ${err.message}`));
-    });
-
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(
-          new Error(`Claude CLIが異常終了しました (code ${code}): ${stderr.trim()}`)
-        );
-        return;
-      }
-      const result = stdout.trim();
-      if (!result) {
-        reject(new Error(`Claude CLIの出力が空です。stderr: ${stderr.trim()}`));
-        return;
-      }
-      resolve(result);
-    });
-
-    // 文字起こし本文を stdin から渡して閉じる
-    child.stdin.write(userPrompt);
-    child.stdin.end();
-  });
-}
 
 // ============================================================
 // Discord 2000文字制限対応のメッセージ分割
@@ -514,13 +426,16 @@ async function saveAndDisconnect() {
     fs.writeFileSync(path.join(sessionDir, "transcript.txt"), combinedTranscript);
     console.log(`文字起こし保存: ${path.join(sessionDir, "transcript.txt")}`);
 
-    // ChatGPTで要約
+    // Claude CLI で議事録を生成（話者名つきの文字起こし）
     console.log("要約を生成中...");
+    const sessionName = path.basename(sessionDir);
     try {
-      const summary = await summarizeTranscript(combinedTranscript);
+      const { summary, usedTokens } = await summarizeTranscript(combinedTranscript, {
+        sessionDate: sessionDateFromLabel(sessionName),
+        hasSpeakers: true,
+      });
 
       // 議事録を日付フォルダに保存
-      const sessionName = path.basename(sessionDir);
       const minutesPath = path.join(sessionDir, `議事録_${sessionName}.md`);
       fs.writeFileSync(minutesPath, summary);
       console.log(`議事録保存: ${minutesPath}`);
@@ -543,10 +458,23 @@ async function saveAndDisconnect() {
       // Discordに「議事録 <日付>」だけ投稿し、そのメッセージのスレッドにBlockNotionのリンクを貼る。
       if (sessionTextChannelId && sessionGuildId) {
         try {
+          let creditBalanceUsd = null;
+          try {
+            creditBalanceUsd = await readOpenAICreditBalance();
+          } catch (err) {
+            console.warn("OpenAI APIクレジット残高の取得に失敗:", err.message);
+          }
+
           const guild = await client.guilds.fetch(sessionGuildId);
           const channel = await guild.channels.fetch(sessionTextChannelId);
 
-          const headerMessage = await channel.send(`議事録 ${sessionName}`);
+          const headerMessage = await channel.send(
+            buildMinutesPostHeader(
+              sessionName,
+              usedTokens,
+              creditBalanceUsd
+            )
+          );
           const thread = await headerMessage.startThread({
             name: `議事録 ${sessionName}`,
           });

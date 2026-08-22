@@ -3,6 +3,7 @@ node_modules/
 config.json
 recordings/
 .claude/
+.openai-billing-profile/
 config.md
 
 # オーケストレーター管理領域（揮発値はコミットしない。定義ファイルは追跡する）

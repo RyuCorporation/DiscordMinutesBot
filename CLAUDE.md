@@ -112,8 +112,13 @@ Minutes are generated from the recording and recorded in TempestPhoenix's BlockN
 
 - `npm start` — Run the bot (`node index.js`)
 - `npm install` — Install dependencies
+- `npm test` — Run the unit tests (`node --test`)
+- `node generate-minutes.js recordings/<session> [--force-transcribe] [--page blk_xxx]` —
+  regenerate minutes from a recorded session. Existing `transcript.txt` is reused unless
+  `--force-transcribe` is given (Whisper is billed per run); `--page` replaces an existing
+  BlockNotion page instead of creating a new one.
 
-No build step, test framework, or linter is configured.
+No build step or linter is configured.
 
 ## Architecture
 
@@ -141,10 +146,18 @@ the BlockNotion integration lives in `post-minutes.js` + `blocknotion/`.
 Minutes and transcripts are recorded in TempestPhoenix's BlockNotion, and only the resulting page URL
 is posted to Discord (in a thread under a `議事録 <session>` message).
 
-- `post-minutes.js` — creates `議事録 <session>` under the "議事録" page (`TP_MINUTES_PARENT_ID`),
-  then `文字起こし <session>` as its child
+- `post-minutes.js` — finds (or creates) the day page `議事録 <YYYY-MM-DD>` under the "議事録" page
+  (`TP_MINUTES_PARENT_ID`), then creates `議事録` and `文字起こし` inside it. A second meeting on the
+  same day appends `議事録 (2)` / `文字起こし (2)`. Day pages are often created by hand, so
+  `parseDatePageTitle()` tolerates `2026-08-22` / `2026/8/22` / `2026年8月22日` / `（土）` suffixes.
+  `replaceMinutesPage()` swaps the content of an existing page in place, keeping its URL.
+- `summarize.js` — the `claude -p` prompt shared by `index.js` and `generate-minutes.js`.
+  Minutes keep the flow of the original conversation (timestamped sections + utterances listed
+  verbatim); they are not compressed into a summary-only document. Pass `hasSpeakers: false` for
+  transcripts made from the mixed `recording.wav`, where speakers cannot be recovered.
 - `blocknotion/client.js` — agent API key → short-lived JWT (`POST /api/admin/auth/agent-token`),
-  then `POST /api/blocks/` (trailing slash required) and `POST /api/blocks/batch`
+  then `POST /api/blocks/` (trailing slash required), `POST /api/blocks/batch`,
+  and `GET`/`DELETE /api/blocks/{id}` for in-place edits
 - `blocknotion/markdown-to-blocks.js` — BlockNotion cannot store Markdown; the minutes Markdown is
   converted to blocks + styled-spans. The rules are a port of TempestPhoenix's `src/Importer`
   (`MarkdownToBlocks.cs` / `InlineMarkdown.cs`) so new pages match the migrated ones. Keep them in sync.
@@ -166,3 +179,7 @@ is posted to Discord (in a thread under a `議事録 <session>` message).
 - Audio uses `EndBehaviorType.AfterSilence` with 1-second timeout to detect speech end
 - WAV headers are manually constructed (44-byte RIFF/WAVE header)
 - Recordings combine all speech segments per user into a single file per session
+
+## AIモデル役割分担（ローカルQwen併用）
+
+このプロジェクトは「**考える＝Claude / Codex（Cloud）／作る＝ローカルQwen／検証する＝Test＋Cloud Review＋人間**」の役割分担で進める。運用ルール・モデル切替コマンド・エスカレーション基準は [docs/ai-workflow.md](docs/ai-workflow.md) を参照。実装タスクの Plan は Cloud 側が `docs/tasks/<タスク名>.md`（[_template.md](docs/tasks/_template.md) を複製）に書いて Qwen へ受け渡す。Qwen はタスク完了時に Implementation Result（同文書のフォーマット）で報告する。

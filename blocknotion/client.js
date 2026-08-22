@@ -79,10 +79,11 @@ export class BlockNotionClient {
   }
 
   /**
-   * 共通の POST。
+   * 共通のリクエスト。
    * 503（レートリミット）は間を空けて再試行し、401 はトークンを取り直して1度だけやり直す。
+   * 204（DELETE の既定）は本文が無いので null を返す。
    */
-  async post(path, body) {
+  async request(method, path, body) {
     let refreshed = false;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -94,12 +95,16 @@ export class BlockNotionClient {
       this.lastRequestAt = Date.now();
 
       const res = await fetch(`${this.apiBase}${path}`, {
-        method: "POST",
+        method,
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-        body: JSON.stringify(body),
+        body: body === undefined ? undefined : JSON.stringify(body),
       });
 
-      if (res.ok) return await res.json();
+      if (res.ok) {
+        if (res.status === 204) return null;
+        const text = await res.text();
+        return text ? JSON.parse(text) : null;
+      }
 
       if (res.status === 401 && !refreshed) {
         // JWT の期限切れとみなして取り直す（キー自体が無効なら accessToken 側が AuthError を投げる）。
@@ -114,6 +119,23 @@ export class BlockNotionClient {
       throw new ApiError(res.status, await res.text().catch(() => ""));
     }
     throw new ApiError(503, "レートリミットが解消されませんでした（最大リトライ到達）");
+  }
+
+  post(path, body) {
+    return this.request("POST", path, body);
+  }
+
+  /**
+   * ブロック1つを取得する。children は { id, pos } の参照リスト（type は含まれない）。
+   * @returns {Promise<{id: string, type: string, props: object, children: {id: string, pos: string}[]}>}
+   */
+  getBlock(id) {
+    return this.request("GET", `/api/blocks/${id}`);
+  }
+
+  /** ブロックを削除する。サブページの中身も含むサブツリー全体が消える。 */
+  deleteBlock(id) {
+    return this.request("DELETE", `/api/blocks/${id}`);
   }
 
   /**

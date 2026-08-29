@@ -10,14 +10,19 @@ import { readOpenAICreditBalance } from "./billing-balance.js";
 import { postMinutesToBlockNotion, sessionDateFromLabel } from "./post-minutes.js";
 import { summarizeTranscript, formatTimestamp } from "./summarize.js";
 import { buildMinutesPostHeader } from "./usage-metrics.js";
+import {
+  SAMPLE_RATE,
+  CHANNELS,
+  BIT_DEPTH,
+  BYTES_PER_MS,
+  buildWavFile,
+  groupChunksIntoSegments,
+} from "./audio.js";
+import { buildTranscribePrompt, transcribeSegments } from "./transcribe.js";
 
 // --- 定数 ---
 const RECORD_DIR = "./recordings";
 if (!fs.existsSync(RECORD_DIR)) fs.mkdirSync(RECORD_DIR);
-
-const SAMPLE_RATE = 48000;
-const CHANNELS = 2;
-const BIT_DEPTH = 16;
 
 // --- OpenAI クライアント ---
 const openai = process.env.OPENAI_API_KEY
@@ -47,108 +52,9 @@ let sessionGuildId = null;       // セッションのギルド
 let currentVoiceChannelId = null; // Bot参加中のVC
 let isProcessing = false;        // saveAndDisconnect実行中フラグ
 
-// ============================================================
-// WAVファイル書き出し（48kHz stereo — アーカイブ用）
-// ============================================================
-function writeWavFile(filePath, pcmBuffer) {
-  const byteRate = SAMPLE_RATE * CHANNELS * (BIT_DEPTH / 8);
-  const blockAlign = CHANNELS * (BIT_DEPTH / 8);
-  const dataSize = pcmBuffer.length;
-  const fileSize = 36 + dataSize;
-
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(fileSize, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(CHANNELS, 22);
-  header.writeUInt32LE(SAMPLE_RATE, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(BIT_DEPTH, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  fs.writeFileSync(filePath, Buffer.concat([header, pcmBuffer]));
-}
-
-// ============================================================
-// WAVファイル書き出し（16kHz mono — Whisper用）
-// ============================================================
-function writeMonoWavFile(filePath, pcmMonoBuffer) {
-  const sampleRate = 16000;
-  const channels = 1;
-  const bitDepth = 16;
-  const byteRate = sampleRate * channels * (bitDepth / 8);
-  const blockAlign = channels * (bitDepth / 8);
-  const dataSize = pcmMonoBuffer.length;
-  const fileSize = 36 + dataSize;
-
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(fileSize, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitDepth, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  fs.writeFileSync(filePath, Buffer.concat([header, pcmMonoBuffer]));
-}
-
-// ============================================================
-// 48kHz stereo → 16kHz mono ダウンサンプル
-// ============================================================
-function downsampleToMono(pcmBuffer) {
-  const bytesPerSampleIn = 2 * 2; // stereo, 16-bit
-  const ratio = 3; // 48000 / 16000
-  const totalFrames = Math.floor(pcmBuffer.length / bytesPerSampleIn);
-  const outFrames = Math.floor(totalFrames / ratio);
-  const outBuffer = Buffer.alloc(outFrames * 2); // mono 16-bit
-
-  for (let i = 0; i < outFrames; i++) {
-    const srcIndex = i * ratio * bytesPerSampleIn;
-    const left = pcmBuffer.readInt16LE(srcIndex);
-    const right = pcmBuffer.readInt16LE(srcIndex + 2);
-    const mono = Math.round((left + right) / 2);
-    outBuffer.writeInt16LE(Math.max(-32768, Math.min(32767, mono)), i * 2);
-  }
-  return outBuffer;
-}
-
-// ============================================================
-// バッファを25MB以下のチャンクに分割
-// ============================================================
-function splitBuffer(buffer, maxBytes = 24 * 1024 * 1024) {
-  const chunks = [];
-  for (let offset = 0; offset < buffer.length; offset += maxBytes) {
-    chunks.push(buffer.subarray(offset, Math.min(offset + maxBytes, buffer.length)));
-  }
-  return chunks;
-}
-
-// ============================================================
-// Whisper APIで文字起こし
-// ============================================================
-async function transcribeAudio(wavFilePath) {
-  const file = fs.createReadStream(wavFilePath);
-  const response = await openai.audio.transcriptions.create({
-    model: "whisper-1",
-    file,
-    language: "ja",
-    response_format: "text",
-  });
-  return response;
-}
-
+// 実時間がこれ以上先行したらパケットロスとみなして位置を合わせ直す。
+// これ未満のズレはジッタなので詰めて書く（穴を空けない）。
+const PACKET_LOSS_RESYNC_MS = 200;
 
 // ============================================================
 // Discord 2000文字制限対応のメッセージ分割
@@ -205,9 +111,26 @@ function startRecording(voiceChannel) {
       frameSize: 960,
     });
 
+    // チャンクごとに Date.now() を貼り付け位置にすると、ジッタの分だけ隙間や
+    // 重なりが生まれる（実測で発話中に毎秒10回、合計で発話時間の約5%が
+    // デジタル無音の穴になっていた）。開始時刻だけ実時計から取り、以降は
+    // 書き込んだサンプル数で位置を進めて隙間なく詰める。
+    // ただしパケットロスで実時間が大きく先行したときは、そのぶん位置を飛ばして
+    // ミックス時の時刻ズレが溜まらないようにする。
+    const segmentStartMs = Date.now() - sessionStartTime;
+    let writtenBytes = 0;
+
     pcmStream.on("data", (chunk) => {
-      const timestamp = Date.now() - sessionStartTime;
-      userBuffers.get(userId).push({ timestamp, chunk });
+      const elapsedMs = Date.now() - sessionStartTime - segmentStartMs;
+      const writtenMs = writtenBytes / BYTES_PER_MS;
+      if (elapsedMs - writtenMs > PACKET_LOSS_RESYNC_MS) {
+        writtenBytes = Math.round(elapsedMs * BYTES_PER_MS);
+      }
+      userBuffers.get(userId).push({
+        timestamp: segmentStartMs + writtenBytes / BYTES_PER_MS,
+        chunk,
+      });
+      writtenBytes += chunk.length;
     });
 
     pcmStream.on("end", () => {
@@ -270,13 +193,11 @@ async function saveAndDisconnect() {
   fs.mkdirSync(sessionDir, { recursive: true });
 
   // --- 全ユーザーのチャンクをミックス ---
-  const bytesPerMs = SAMPLE_RATE * CHANNELS * (BIT_DEPTH / 8) / 1000;
-
   // セッション全体の長さを算出（ms）
   let maxEndMs = 0;
   for (const chunks of userBuffers.values()) {
     for (const { timestamp, chunk } of chunks) {
-      const endMs = timestamp + chunk.length / bytesPerMs;
+      const endMs = timestamp + chunk.length / BYTES_PER_MS;
       if (endMs > maxEndMs) maxEndMs = endMs;
     }
   }
@@ -294,14 +215,14 @@ async function saveAndDisconnect() {
   }
 
   // ゼロ埋めバッファを用意（Int16サンプル単位で加算するため）
-  const totalBytes = Math.ceil(maxEndMs * bytesPerMs);
+  const totalBytes = Math.ceil(maxEndMs * BYTES_PER_MS);
   // 2バイト境界に揃える
   const alignedBytes = totalBytes + (totalBytes % 2);
   const mixBuffer = Buffer.alloc(alignedBytes);
 
   for (const chunks of userBuffers.values()) {
     for (const { timestamp, chunk } of chunks) {
-      const offsetBytes = Math.round(timestamp * bytesPerMs);
+      const offsetBytes = Math.round(timestamp * BYTES_PER_MS);
       // 2バイト境界に揃える
       const alignedOffset = offsetBytes - (offsetBytes % 2);
 
@@ -319,7 +240,7 @@ async function saveAndDisconnect() {
 
   // ミックス済みWAV保存（48kHz stereo）
   const mixedWavPath = path.join(sessionDir, "recording.wav");
-  writeWavFile(mixedWavPath, mixBuffer);
+  fs.writeFileSync(mixedWavPath, buildWavFile(mixBuffer));
 
   const durationSec = (
     mixBuffer.length / (SAMPLE_RATE * CHANNELS * (BIT_DEPTH / 8))
@@ -329,8 +250,9 @@ async function saveAndDisconnect() {
   // --- ユーザーごとにWhisper文字起こし ---
   let combinedTranscript = "";
   if (openai) {
-    // ユーザーごとの音声バッファを構築し、個別に文字起こし
+    // ユーザーごとの発話区間を取り出し、個別に文字起こし
     const allSegments = []; // { startMs, speaker, text }
+    const prompt = buildTranscribePrompt();
 
     for (const [userId, chunks] of userBuffers.entries()) {
       if (chunks.length === 0) continue;
@@ -348,66 +270,23 @@ async function saveAndDisconnect() {
         } catch {}
       }
 
-      // ユーザーごとのタイムライン音声バッファを構築
-      let userMaxEndMs = 0;
-      for (const { timestamp, chunk } of chunks) {
-        const endMs = timestamp + chunk.length / bytesPerMs;
-        if (endMs > userMaxEndMs) userMaxEndMs = endMs;
-      }
+      // 実際に喋っている区間だけを取り出してWhisperへ送る。
+      // 無音を含むタイムラインを丸ごと送ると、30秒窓ごとに定型句を捏造する。
+      const speechSegments = groupChunksIntoSegments(chunks);
+      const spokenSec =
+        speechSegments.reduce((a, s) => a + s.pcm.length / BYTES_PER_MS, 0) / 1000;
+      console.log(
+        `文字起こし: ${username} — ${speechSegments.length}区間 / ${spokenSec.toFixed(0)}秒`
+      );
 
-      const userTotalBytes = Math.ceil(userMaxEndMs * bytesPerMs);
-      const userAlignedBytes = userTotalBytes + (userTotalBytes % 2);
-      const userBuffer = Buffer.alloc(userAlignedBytes);
-
-      for (const { timestamp, chunk } of chunks) {
-        const offsetBytes = Math.round(timestamp * bytesPerMs);
-        const alignedOffset = offsetBytes - (offsetBytes % 2);
-        for (let i = 0; i < chunk.length - 1; i += 2) {
-          const pos = alignedOffset + i;
-          if (pos + 1 >= userBuffer.length) break;
-          const existing = userBuffer.readInt16LE(pos);
-          const incoming = chunk.readInt16LE(i);
-          const mixed = Math.max(-32768, Math.min(32767, existing + incoming));
-          userBuffer.writeInt16LE(mixed, pos);
-        }
-      }
-
-      // ダウンサンプルしてWhisperに送信（verbose_jsonでタイムスタンプ取得）
-      const monoBuffer = downsampleToMono(userBuffer);
-      const audioChunks = splitBuffer(monoBuffer);
-
-      for (let i = 0; i < audioChunks.length; i++) {
-        const tempPath = path.join(RECORD_DIR, `temp_${userId}_${i}.wav`);
-        writeMonoWavFile(tempPath, audioChunks[i]);
-
-        try {
-          const file = fs.createReadStream(tempPath);
-          const response = await openai.audio.transcriptions.create({
-            model: "whisper-1",
-            file,
-            language: "ja",
-            response_format: "verbose_json",
-            timestamp_granularities: ["segment"],
-          });
-
-          // チャンクのオフセット（秒）を計算
-          const chunkOffsetSec = (i * 24 * 1024 * 1024) / (16000 * 2); // 16kHz mono 16bit
-          for (const seg of (response.segments || [])) {
-            const text = seg.text.trim();
-            if (!text) continue;
-            allSegments.push({
-              startMs: Math.round((seg.start + chunkOffsetSec) * 1000),
-              speaker: username,
-              text,
-            });
-          }
-        } catch (err) {
-          console.error(`Whisper error (${username} chunk ${i}):`, err.message);
-        }
-
-        try {
-          fs.unlinkSync(tempPath);
-        } catch {}
+      const results = await transcribeSegments({
+        openai,
+        segments: speechSegments,
+        prompt,
+        label: username,
+      });
+      for (const { startMs, text } of results) {
+        allSegments.push({ startMs, speaker: username, text });
       }
     }
 

@@ -23,61 +23,10 @@ import {
 import { summarizeTranscript, formatTimestamp } from "./summarize.js";
 import { buildMinutesPostHeader } from "./usage-metrics.js";
 import { readOpenAICreditBalance } from "./billing-balance.js";
+import { SAMPLE_RATE, detectSpeechSegments, sliceSegments } from "./audio.js";
+import { buildTranscribePrompt, transcribeSegments } from "./transcribe.js";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// --- WAV関連ヘルパー（index.jsと同じ） ---
-function writeMonoWavFile(filePath, pcmMonoBuffer) {
-  const sampleRate = 16000;
-  const channels = 1;
-  const bitDepth = 16;
-  const byteRate = sampleRate * channels * (bitDepth / 8);
-  const blockAlign = channels * (bitDepth / 8);
-  const dataSize = pcmMonoBuffer.length;
-  const fileSize = 36 + dataSize;
-
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(fileSize, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(channels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitDepth, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  fs.writeFileSync(filePath, Buffer.concat([header, pcmMonoBuffer]));
-}
-
-function downsampleToMono(pcmBuffer) {
-  const bytesPerSampleIn = 2 * 2; // stereo, 16-bit
-  const ratio = 3; // 48000 / 16000
-  const totalFrames = Math.floor(pcmBuffer.length / bytesPerSampleIn);
-  const outFrames = Math.floor(totalFrames / ratio);
-  const outBuffer = Buffer.alloc(outFrames * 2); // mono 16-bit
-
-  for (let i = 0; i < outFrames; i++) {
-    const srcIndex = i * ratio * bytesPerSampleIn;
-    const left = pcmBuffer.readInt16LE(srcIndex);
-    const right = pcmBuffer.readInt16LE(srcIndex + 2);
-    const mono = Math.round((left + right) / 2);
-    outBuffer.writeInt16LE(Math.max(-32768, Math.min(32767, mono)), i * 2);
-  }
-  return outBuffer;
-}
-
-function splitBuffer(buffer, maxBytes = 24 * 1024 * 1024) {
-  const chunks = [];
-  for (let offset = 0; offset < buffer.length; offset += maxBytes) {
-    chunks.push(buffer.subarray(offset, Math.min(offset + maxBytes, buffer.length)));
-  }
-  return chunks;
-}
 
 // --- Discord投稿 ---
 // index.js と同じ形（「議事録 <日付>」メッセージ + そのスレッドにBlockNotionのリンク）で投稿する。
@@ -151,61 +100,36 @@ async function main() {
   // WAVヘッダー（44バイト）をスキップしてPCMデータを取得
   const pcmBuffer = wavData.subarray(44);
 
-  const durationSec = (pcmBuffer.length / (48000 * 2 * 2)).toFixed(1);
-  console.log(`音声長: ${durationSec}秒`);
+  const durationSec = pcmBuffer.length / (SAMPLE_RATE * 2 * 2);
+  console.log(`音声長: ${durationSec.toFixed(1)}秒`);
 
-  // 48kHz stereo → 16kHz mono ダウンサンプル
-  console.log("ダウンサンプル中...");
-  const monoBuffer = downsampleToMono(pcmBuffer);
+  // 実際に音が鳴っている区間だけを取り出す。
+  // 無音のまま渡すと Whisper が 30 秒窓ごとに定型句を捏造するため。
+  console.log("発話区間を検出中...");
+  const speech = detectSpeechSegments(pcmBuffer);
+  const segments = sliceSegments(pcmBuffer, speech);
+  const spokenSec = speech.reduce((a, s) => a + (s.endMs - s.startMs), 0) / 1000;
+  console.log(
+    `発話区間: ${segments.length}件 / ${spokenSec.toFixed(0)}秒` +
+      `（全体の ${((spokenSec / durationSec) * 100).toFixed(0)}%）`
+  );
 
-  // 24MBチャンクに分割
-  const audioChunks = splitBuffer(monoBuffer);
-  console.log(`チャンク数: ${audioChunks.length}`);
-
-  // Whisperで文字起こし
-  console.log("Whisper文字起こし中...");
-  const allSegments = [];
-
-  for (let i = 0; i < audioChunks.length; i++) {
-    const tempPath = path.join(sessionDir, `temp_chunk_${i}.wav`);
-    writeMonoWavFile(tempPath, audioChunks[i]);
-
-    try {
-      console.log(`  チャンク ${i + 1}/${audioChunks.length} を処理中...`);
-      const file = fs.createReadStream(tempPath);
-      const response = await openai.audio.transcriptions.create({
-        model: "whisper-1",
-        file,
-        language: "ja",
-        response_format: "verbose_json",
-        timestamp_granularities: ["segment"],
-      });
-
-      const chunkOffsetSec = (i * 24 * 1024 * 1024) / (16000 * 2);
-      for (const seg of response.segments || []) {
-        const text = seg.text.trim();
-        if (!text) continue;
-        allSegments.push({
-          startSec: seg.start + chunkOffsetSec,
-          text,
-        });
-      }
-    } catch (err) {
-      console.error(`Whisperエラー (チャンク ${i}):`, err.message);
-    }
-
-    try {
-      fs.unlinkSync(tempPath);
-    } catch {}
+  if (segments.length === 0) {
+    console.error("発話区間が見つかりませんでした。");
+    process.exit(1);
   }
 
-  // タイムスタンプでソート
-  allSegments.sort((a, b) => a.startSec - b.startSec);
+  console.log("Whisper文字起こし中...");
+  const allSegments = await transcribeSegments({
+    openai,
+    segments,
+    prompt: buildTranscribePrompt(),
+  });
 
   // ミックス済み音声なので話者分離はできない。
   // ただしタイムスタンプは議事録の骨組みになるので index.js と同じ形で残す（話者名だけ無い）。
   const transcript = allSegments
-    .map((s) => `[${formatTimestamp(s.startSec * 1000)}] ${s.text}`)
+    .map((s) => `[${formatTimestamp(s.startMs)}] ${s.text}`)
     .join("\n");
 
   if (!transcript) {

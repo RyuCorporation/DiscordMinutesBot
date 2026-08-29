@@ -123,7 +123,8 @@ No build step or linter is configured.
 ## Architecture
 
 Node.js application using ES modules (`"type": "module"`). Recording lives in `index.js`;
-the BlockNotion integration lives in `post-minutes.js` + `blocknotion/`.
+audio handling in `audio.js`, Whisper calls in `transcribe.js`, and the BlockNotion
+integration in `post-minutes.js` + `blocknotion/`.
 
 ### Core Flow
 
@@ -134,6 +135,30 @@ the BlockNotion integration lives in `post-minutes.js` + `blocknotion/`.
 5. PCM chunks accumulate in `userBuffers` Map (keyed by userId) across speech segments
 6. When all humans leave: `saveAndDisconnect()` writes WAV files to `recordings/{username}/{timestamp}.wav` and disconnects
 7. Transcribe (Whisper) → summarize (`claude -p`) → post to BlockNotion → post the page URL to Discord
+
+### Transcription accuracy — three things that must not regress
+
+Measured on real recordings; each was worth a large chunk of the transcript.
+
+- **Never send silence to Whisper.** It fabricates one boilerplate line
+  ("ご視聴ありがとうございました" etc.) per 30-second window of silence. In
+  `recordings/2026-08-29` that was 34 of 98 lines; in `2026-08-22`, ~46%. Both paths now
+  transcribe speech segments only — `groupChunksIntoSegments()` for the per-speaker path
+  (chunk timing already tells us where speech is) and `detectSpeechSegments()` (energy VAD)
+  for the mixed-audio path. Timestamps are mapped back via `mapToSourceMs()`.
+- **Chunk timestamps must advance by sample count, not by `Date.now()`.** Placing each 20ms
+  PCM chunk at its wall-clock arrival time turned jitter into holes: 10.3 dropouts/sec during
+  speech, 4.75% of speech time lost as digital silence. `Date.now()` is now only read at the
+  start of a speech segment; `PACKET_LOSS_RESYNC_MS` re-syncs when real loss (>200ms) occurs.
+- **Downsample through a low-pass filter.** Plain 3:1 decimation folds >8kHz back into the
+  band at -24dB — louder than the real 6–8kHz consonant energy. `decimateToMono16k()` applies
+  a 7.6kHz FIR first. Note: the filter *alone* made whisper-1 emit fabricated speaker labels
+  ("おだしょー") on 119 of 167 lines in one A/B run; it only tested clean combined with
+  silence removal and the vocabulary prompt. Keep the three together.
+
+Whisper also gets a vocabulary `prompt` (`buildTranscribePrompt()`), taken from a
+`## 文字起こし語彙` section in `config.md` if present. This is what fixes ギミック→リミック
+class errors. Whisper truncates the prompt at 224 tokens (~150 Japanese characters).
 
 ### Key State
 
